@@ -6,5 +6,5 @@ for t in test/*.test.js; do
   node "$t"
 done
 omarchy plugin validate .
-qmllint -I "$OMARCHY_SOURCE/shell" MonitorLayout.qml
+"$(command -v qmllint || echo /usr/lib/qt6/bin/qmllint)" -I "$OMARCHY_SOURCE/shell" MonitorLayout.qml
 echo "ok - monitor layout manifest and QML"

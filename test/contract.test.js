@@ -25,11 +25,14 @@ assert.match(panel, /Qt\.Key_Escape/)
 
 // Every change goes through the sanitized model builders — nothing
 // unvalidated reaches hyprctl eval — and applies via the house Lua path.
-assert.match(panel, /MonitorLayoutModel\.applyCommand/)
+assert.match(panel, /MonitorLayoutModel\.applyBatchCommand/)
 assert.match(panel, /MonitorLayoutModel\.parseMonitors/)
 assert.match(panel, /MonitorLayoutModel\.buildFlagContent/)
 assert.match(panel, /MonitorLayoutModel\.normalizePositions/)
-assert.match(panel, /MonitorLayoutModel\.snap/)
+assert.match(panel, /MonitorLayoutModel\.snapToNeighbours/)
+assert.match(panel, /MonitorLayoutModel\.changedMonitors/, 'every monitor a move touches is applied')
+assert.match(panel, /pendingCommands/, 'applies are queued, never dropped')
+assert.match(panel, /interactive: contentHeight > height/, 'the flickable never steals drags')
 assert.match(panel, /if \(command === null\)/, 'rejected specs never run')
 assert.doesNotMatch(panel, /keyword monitor/, 'never the keyword path under the Lua provider')
 

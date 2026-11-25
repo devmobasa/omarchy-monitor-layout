@@ -27,6 +27,7 @@ Item {
 
   property var monitors: []
   property bool applying: false
+  property var pendingCommands: []
   property string layoutError: ""
   property bool layoutSaved: false
 
@@ -81,31 +82,57 @@ Item {
 
   // ---- data + apply chain --------------------------------------------------
   function refreshMonitors() {
-    if (!monitorsProcess.running) {
-      monitorsProcess.exitSeen = false
-      monitorsProcess.running = true
+    if (monitorsProcess.running) {
+      monitorsProcess.refreshPending = true
+      return
     }
+    monitorsProcess.exitSeen = false
+    monitorsProcess.running = true
   }
 
-  function applyMonitor(monitor) {
-    var command = MonitorLayoutModel.applyCommand(monitor)
+  // Commands run one at a time, in order; nothing is dropped when changes
+  // arrive faster than hyprctl returns. The model refreshes once the queue
+  // drains, so the UI never flips back to a half-applied state.
+  function enqueue(command) {
     if (command === null) {
-      layoutError = "invalid settings for " + monitor.name
+      layoutError = "invalid settings"
+      root.refreshMonitors()
       return
     }
     layoutError = ""
-    applyProcess.command = command
+    pendingCommands = pendingCommands.concat([command])
+    pumpQueue()
+  }
+
+  function pumpQueue() {
+    if (applyProcess.running || pendingCommands.length === 0) return
+    var queue = pendingCommands.slice()
+    applyProcess.command = queue.shift()
+    pendingCommands = queue
     applyProcess.exitSeen = false
     applyProcess.running = true
   }
 
   function changeMonitor(index, changes) {
     if (index < 0 || index >= monitors.length) return
-    var next = monitors.slice()
+    var before = monitors
+    var oldSize = MonitorLayoutModel.logicalSize(before[index])
+    var next = before.slice()
     next[index] = MonitorLayoutModel.mergeMonitor(next[index], changes)
+    next = MonitorLayoutModel.reflowAfterResize(next, index, oldSize)
     next = MonitorLayoutModel.normalizePositions(next)
+    var changed = MonitorLayoutModel.changedMonitors(before, next)
     monitors = next
-    applyMonitor(next[index])
+    if (changed.length === 0) return
+    var enabling = changes.disabled === false ? [next[index].name] : []
+    enqueue(MonitorLayoutModel.applyBatchCommand(changed, enabling))
+  }
+
+  // Drop handler: snap to neighbouring edges/centers, then apply every
+  // monitor the move (and the origin normalization) touched.
+  function moveMonitor(index, x, y, threshold) {
+    var p = MonitorLayoutModel.snapToNeighbours(monitors, index, x, y, threshold)
+    changeMonitor(index, { x: p.x, y: p.y })
   }
 
   function cycleMode(index, step) {
@@ -144,12 +171,20 @@ Item {
   Process {
     id: monitorsProcess
     property bool exitSeen: false
+    property bool refreshPending: false
     command: MonitorLayoutModel.monitorsCommand()
+    onRunningChanged: {
+      if (running || !refreshPending) return
+      refreshPending = false
+      root.refreshMonitors()
+    }
 
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         monitorsProcess.exitSeen = true
+        // A pending apply will refresh again; don't show stale state meanwhile.
+        if (applyProcess.running || root.pendingCommands.length > 0) return
         root.monitors = MonitorLayoutModel.parseMonitors(text)
       }
     }
@@ -159,11 +194,17 @@ Item {
     id: applyProcess
     property bool exitSeen: false
     command: ["hyprctl", "eval", "hl.no_op or true"]
-    onRunningChanged: if (!running && !exitSeen) root.layoutError = "hyprctl could not be started"
+    onRunningChanged: {
+      if (running || exitSeen) return
+      root.layoutError = "hyprctl could not be started"
+      root.pendingCommands = []
+      root.refreshMonitors()
+    }
     onExited: function (exitCode) {
       exitSeen = true
       if (exitCode !== 0) root.layoutError = "apply failed"
-      root.refreshMonitors()
+      if (root.pendingCommands.length > 0) root.pumpQueue()
+      else root.refreshMonitors()
     }
   }
 
@@ -257,7 +298,7 @@ Item {
 
       BorderSurface {
         anchors.centerIn: parent
-        width: Math.min(Style.space(520), 720)
+        width: Math.min(Style.space(780), panel.width * 0.92)
         height: Math.min(layoutColumn.implicitHeight + Style.space(32), panel.height * 0.9)
         radius: Style.cornerRadius
         color: Color.menu.background
@@ -273,6 +314,8 @@ Item {
           anchors.margins: Style.space(16)
           contentHeight: layoutColumn.implicitHeight
           clip: true
+          // Only scroll when content overflows, so it never steals monitor drags.
+          interactive: contentHeight > height
           boundsBehavior: Flickable.StopAtBounds
 
           Column {
@@ -322,12 +365,14 @@ Item {
             Rectangle {
               id: canvas
               width: parent.width
-              height: Style.space(180)
+              height: Style.space(280)
               radius: Style.cornerRadius
               color: Qt.rgba(Color.menu.text.r, Color.menu.text.g, Color.menu.text.b, 0.05)
 
               readonly property real drawScale: MonitorLayoutModel.canvasScale(
-                root.monitors, width - Style.space(24), height - Style.space(24))
+                root.monitors, width, height)
+              readonly property var offset: MonitorLayoutModel.canvasOffset(
+                root.monitors, width, height, drawScale)
 
               Repeater {
                 model: root.monitors
@@ -341,8 +386,9 @@ Item {
                   readonly property var logical: MonitorLayoutModel.logicalSize(modelData)
                   width: Math.max(24, logical.w * canvas.drawScale)
                   height: Math.max(16, logical.h * canvas.drawScale)
-                  x: Style.space(12) + modelData.x * canvas.drawScale
-                  y: Style.space(12) + modelData.y * canvas.drawScale
+                  x: canvas.offset.x + modelData.x * canvas.drawScale
+                  y: canvas.offset.y + modelData.y * canvas.drawScale
+                  z: rectDrag.active ? 1 : 0
                   radius: Style.cornerRadius / 2
                   color: rectDrag.active
                     ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.35)
@@ -350,13 +396,33 @@ Item {
                   border.width: 1
                   border.color: Color.accent
 
-                  Text {
+                  Column {
                     anchors.centerIn: parent
-                    text: monitorRect.modelData.name
-                    color: Color.menu.text
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
+                    width: parent.width - Style.space(8)
+
+                    Text {
+                      width: parent.width
+                      horizontalAlignment: Text.AlignHCenter
+                      textFormat: Text.PlainText
+                      text: monitorRect.modelData.name
+                      color: Color.menu.text
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      width: parent.width
+                      horizontalAlignment: Text.AlignHCenter
+                      textFormat: Text.PlainText
+                      text: (monitorRect.modelData.model || monitorRect.modelData.description)
+                        + (monitorRect.modelData.serial ? " · " + monitorRect.modelData.serial.slice(-4) : "")
+                      color: Color.menu.text
+                      opacity: 0.7
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
                   }
 
                   DragHandler {
@@ -364,12 +430,12 @@ Item {
                     onActiveChanged: {
                       if (active) return
                       // Convert the dropped pixel position back to layout
-                      // coordinates, snapped; normalization keeps origin 0,0.
-                      var newX = MonitorLayoutModel.snap(
-                        (monitorRect.x - Style.space(12)) / canvas.drawScale, 16)
-                      var newY = MonitorLayoutModel.snap(
-                        (monitorRect.y - Style.space(12)) / canvas.drawScale, 16)
-                      root.changeMonitor(monitorRect.index, { x: Math.max(0, newX), y: Math.max(0, newY) })
+                      // coordinates (negative is fine: normalization moves
+                      // the whole layout back to origin 0,0), then snap to
+                      // neighbours within ~16 canvas pixels.
+                      var newX = (monitorRect.x - canvas.offset.x) / canvas.drawScale
+                      var newY = (monitorRect.y - canvas.offset.y) / canvas.drawScale
+                      root.moveMonitor(monitorRect.index, newX, newY, Style.space(16) / canvas.drawScale)
                     }
                   }
                 }
@@ -388,6 +454,7 @@ Item {
                 spacing: Style.space(3)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: monitorRow.modelData.name + " · " + monitorRow.modelData.description
                   width: parent.width
                   color: Color.menu.text
@@ -412,13 +479,13 @@ Item {
                   }
 
                   Button {
-                    text: "scale " + monitorRow.modelData.scale
-                    tooltipText: "Click +0.25, right-click −0.25"
+                    text: "scale " + MonitorLayoutModel.formatScale(monitorRow.modelData.scale)
+                    tooltipText: "Click for the next valid scale up, right-click down"
                     enabled: !monitorRow.modelData.disabled
-                    onClicked: root.changeMonitor(monitorRow.index,
-                      { scale: Math.min(3, monitorRow.modelData.scale + 0.25) })
-                    onRightClicked: root.changeMonitor(monitorRow.index,
-                      { scale: Math.max(0.5, monitorRow.modelData.scale - 0.25) })
+                    onClicked: root.changeMonitor(monitorRow.index, { scale: MonitorLayoutModel.stepScale(
+                      monitorRow.modelData.scale, monitorRow.modelData.width, monitorRow.modelData.height, 1) })
+                    onRightClicked: root.changeMonitor(monitorRow.index, { scale: MonitorLayoutModel.stepScale(
+                      monitorRow.modelData.scale, monitorRow.modelData.width, monitorRow.modelData.height, -1) })
                   }
 
                   Button {
@@ -452,7 +519,7 @@ Item {
 
             Text {
               width: parent.width
-              text: "Changes apply instantly. Save writes the layout keyed by monitor identity (EDID), so it re-applies whenever that monitor is connected — until you Forget it."
+              text: "Drag a monitor near another and it snaps edge-to-edge (or centered). Changes apply instantly. Save writes the layout keyed by monitor identity (EDID), so it re-applies whenever that monitor is connected — until you Forget it."
               color: Qt.darker(Color.menu.text, 1.5)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
